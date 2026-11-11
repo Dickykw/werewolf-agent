@@ -318,28 +318,56 @@ class Evidence:
         # Quiet players are slightly suspicious late; talkative accusers less so.
         return s
 
+    def claim_record(self, claimant):
+        """(good, bad): the claimant's inspections that matched / contradicted
+        later reveals. A claimant with bad > 0 and good == 0 is likely lying."""
+        good = 0
+        bad = 0
+        for _day, target, said_wolf in self.seer_claims.get(claimant, []):
+            if target is None or said_wolf is None:
+                continue
+            role = revealed_role(self.view, target)
+            if role is None:
+                continue
+            if (role == WOLF) == said_wolf:
+                good += 1
+            else:
+                bad += 1
+        return good, bad
+
     def credible_seer_wolf(self):
         """A wolf named by a credible seer claim, or None.
 
         A claim names a wolf when a player said they inspected a seat and
-        it is a werewolf. It is credible when the named seat is alive, has
-        not been revealed innocent, and I have not inspected it myself and
-        found it innocent. With two claimants naming different wolves, the
-        one whose target I already suspect most wins.
+        it is a werewolf. It is credible when the claimant is not a known
+        wolf, the named seat is alive and not known innocent, and the
+        claimant's past inspections check out against revealed roles (a
+        claimant whose inspections were contradicted and never verified is
+        likely the lying wolf). With several claimants, the one with
+        verified inspections and the most recent claim wins; ties break to
+        the target I already suspect most.
         """
         best = None
         best_score = None
         for claimant, claims in self.seer_claims.items():
-            if claimant == self.me or claimant not in living_seats(self.view):
+            if claimant == self.me or claimant in self.known_wolf:
                 continue
-            for _day, target, said_wolf in claims:
+            good, bad = self.claim_record(claimant)
+            if bad > 0 and good == 0:
+                continue  # contradicted and never verified: likely lying
+            for day, target, said_wolf in claims:
                 if target is None or not said_wolf:
                     continue
                 if target not in living_seats(self.view):
                     continue
                 if target in self.known_innocent:
                     continue
-                score = self.suspicion.get(target, 0.0)
+                score = (
+                    self.suspicion.get(target, 0.0)
+                    + 20.0 * good
+                    - 25.0 * bad
+                    + 5.0 * day
+                )
                 if best is None or score > best_score:
                     best, best_score = target, score
         return best
@@ -428,7 +456,14 @@ def choose_protect(ev, options, rng):
     candidates = [o for o in options if o != ev.me]
     if not candidates:
         return None
-    claimants = [c for c in ev.seer_claims if c in candidates and c != ev.me]
+    claimants = []
+    for c in ev.seer_claims:
+        if c not in candidates or c == ev.me:
+            continue
+        good, bad = ev.claim_record(c)
+        if bad > 0 and good == 0:
+            continue  # discredited: likely a lying wolf, not worth guarding
+        claimants.append(c)
     if claimants:
         best = None
         best_good = -1
@@ -454,6 +489,15 @@ def choose_protect(ev, options, rng):
 def choose_inspect(ev, options, rng):
     """Seer night inspection: the most suspicious player not yet inspected."""
     done = {r["seat"] for r in (ev.view.get("seerResults") or [])}
+    # A rival seer claimant must be checked first: inspecting them settles
+    # whether they are the real seer or a lying wolf.
+    rivals = [c for c in ev.seer_claims if c != ev.me and c in options and c not in done]
+    if rivals:
+        scored = []
+        for seat in rivals:
+            scored.append((ev.suspicion.get(seat, 0.0), seat))
+        scored.sort(key=lambda t: (-t[0], rng.random()))
+        return scored[0][1]
     candidates = [o for o in options if o not in done and o != ev.me]
     if not candidates:
         candidates = [o for o in options if o != ev.me]
@@ -525,12 +569,12 @@ def wolf_speech(ev, rng):
     accused_me = [a for _d, a, t in ev.accusations if t == me]
     if accused_me:
         templates = [
-            "I am not a wolf. {accuser} is pushing me without evidence; look at who benefits from that.",
+            "I am not a wolf. Seat {accuser} is pushing me without evidence; look at who benefits from that.",
             "This accusation against me has no basis. I have voted with the village every day.",
-            "I am a villager. {accuser} keeps pointing at me instead of looking for the real wolves.",
+            "I am a villager. Seat {accuser} keeps pointing at me instead of looking for the real wolves.",
         ]
         t = rng.choice(templates)
-        return t.format(accuser=seat_name(view, accused_me[-1]))
+        return t.format(accuser=accused_me[-1])
     # Otherwise echo suspicion of a villager the village already doubts.
     pool = [o for o in living_seats(view) if o not in ev.known_wolf and o != me]
     if not pool:
@@ -539,14 +583,14 @@ def wolf_speech(ev, rng):
     if target is None or target == me:
         target = rng.choice(pool)
     templates = [
-        "I find {target} suspicious. Their votes have not lined up with what the village needed.",
-        "Watch {target}: they keep deflecting whenever the talk turns to them.",
-        "{target} has been quiet at the wrong moments. I think we should look at them today.",
-        "I agree with the doubts about {target}. Something about their story does not add up.",
-        "Has anyone else noticed {target} avoiding the hard questions? That worries me.",
-        "I am leaning toward {target} today. Their reasoning feels off to me.",
+        "I find seat {target} suspicious. Their votes have not lined up with what the village needed.",
+        "Watch seat {target}: they keep deflecting whenever the talk turns to them.",
+        "Seat {target} has been quiet at the wrong moments. I think we should look at them today.",
+        "I agree with the doubts about seat {target}. Something about their story does not add up.",
+        "Has anyone else noticed seat {target} avoiding the hard questions? That worries me.",
+        "I am leaning toward seat {target} today. Their reasoning feels off to me.",
     ]
-    return rng.choice(templates).format(target=seat_name(view, target))
+    return rng.choice(templates).format(target=target)
 
 
 def villager_speech(ev, rng):
@@ -564,14 +608,14 @@ def villager_speech(ev, rng):
             if claimant is not None:
                 break
         if claimant is not None:
+            # Rebroadcast the claim with the seat number right after
+            # "inspected", so every player at the table can follow it.
             templates = [
-                "I believe {claimant}'s seer claim about {target}. Vote {target} today.",
-                "{claimant} says {target} is a werewolf, and I believe them. Let us vote {target}.",
-                "The seer claim on {target} is the strongest lead we have. I am voting {target}.",
+                "Seat {claimant} inspected seat {target} and seat {target} is a werewolf. Vote seat {target} today.",
+                "I believe seat {claimant}'s seer claim: seat {target} is a werewolf. Vote seat {target}.",
+                "The seer claim on seat {target} is the strongest lead we have. I am voting seat {target}.",
             ]
-            return rng.choice(templates).format(
-                claimant=seat_name(view, claimant), target=seat_name(view, claimed)
-            )
+            return rng.choice(templates).format(claimant=claimant, target=claimed)
     target, score = ev.most_suspicious()
     if target is None:
         templates = [
@@ -579,34 +623,36 @@ def villager_speech(ev, rng):
             "I have no strong read so far. I am listening.",
         ]
         return rng.choice(templates)
-    # A reason, when the evidence gives one.
+    # A reason, when the evidence gives one. Incriminating: the target
+    # voted to exile someone later revealed innocent, or defended a
+    # revealed wolf.
     reason = None
     for day, voter, tgt in ev.votes:
-        if voter == target and tgt is not None and revealed_role(view, tgt) == WOLF:
-            reason = "%s voted to exile %s, who turned out to be a werewolf" % (
-                seat_name(view, target),
-                seat_name(view, tgt),
-            )
-            break
-    if reason is None:
-        for day, voter, tgt in ev.votes:
-            if voter == target and tgt is not None and revealed_role(view, tgt) is not None:
-                reason = "%s voted to exile %s, who turned out to be a %s" % (
-                    seat_name(view, target),
-                    seat_name(view, tgt),
-                    revealed_role(view, tgt),
+        if voter == target and tgt is not None:
+            role = revealed_role(view, tgt)
+            if role is not None and role != WOLF:
+                reason = "seat %d voted to exile seat %d, who turned out to be a %s" % (
+                    target,
+                    tgt,
+                    role,
                 )
                 break
     if reason is None:
-        reason = "%s has been the least consistent voice at this table" % seat_name(view, target)
+        for day, defender, defended in ev.defenses:
+            if defender == target and revealed_role(view, defended) == WOLF:
+                reason = "seat %d defended seat %d, who turned out to be a werewolf" % (
+                    target,
+                    defended,
+                )
+                break
+    if reason is None:
+        reason = "seat %d has been the least consistent voice at this table" % target
     templates = [
-        "I suspect {target}. {reason}.",
-        "{target} worries me. {reason}.",
-        "Look at {target}: {reason}. I think we should vote them today.",
+        "Seat {target} looks like the werewolf to me. {reason}.",
+        "Seat {target} worries me. {reason}.",
+        "Look at seat {target}: {reason}. I think seat {target} is the one to exile today.",
     ]
-    return rng.choice(templates).format(
-        target=seat_name(view, target), reason=reason
-    )
+    return rng.choice(templates).format(target=target, reason=reason)
 
 
 def seer_speech(ev, rng):
@@ -621,10 +667,10 @@ def seer_speech(ev, rng):
                 night = r["night"]
         if night is not None:
             return (
-                "I am the seer. I inspected %s on night %d and they are a werewolf. "
-                "Vote %s today." % (seat_name(view, target), night, seat_name(view, target))
+                "I am the seer. I inspected seat %d on night %d and they are a werewolf. "
+                "Vote seat %d today." % (target, night, target)
             )
-        return "I am the seer, and %s is a werewolf. Vote them today." % seat_name(view, target)
+        return "I am the seer, and seat %d is a werewolf. Vote seat %d today." % (target, target)
     return villager_speech(ev, rng)
 
 
